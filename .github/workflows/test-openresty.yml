@@ -1,0 +1,147 @@
+# Test-only workflow for the OpenResty 1.31.8.1 bump. Lives on a separate
+# branch of the fork and is NOT part of the upstream PR.
+name: Test OpenResty bump
+
+on:
+  push:
+    branches: ["ci/test-openresty-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_TAG: ci
+  TAG_PREFIX: ci-
+  EXPECTED_OPENRESTY: "1.31.8.1"
+
+jobs:
+  nginx-full:
+    name: nginx-full (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Bake all targets
+        run: |
+          docker buildx bake --file docker/docker-bake.hcl --progress=plain --load \
+            --set "*.platform=linux/${{ matrix.arch }}"
+          docker image ls nginxproxymanager/nginx-full
+
+      - name: Upstream CI tests (scripts/ci/test.sh)
+        run: |
+          # test.sh pulls the tag from Docker Hub first; skip that so the images built above are tested
+          sed -i 's/^\tdocker compose pull$/\ttrue # pull skipped: testing locally built image/' scripts/ci/test.sh
+          grep -q 'pull skipped' scripts/ci/test.sh
+          for tag in ci ci-certbot ci-certbot-node ci-acmesh ci-acmesh-golang; do
+            scripts/ci/test.sh "$tag"
+          done
+
+      - name: Verify OpenResty/nginx version, geoip2 and Lua modules
+        run: |
+          for tag in ci ci-certbot ci-certbot-node ci-acmesh ci-acmesh-golang; do
+            bash .github/ci-verify.sh "nginxproxymanager/nginx-full:$tag"
+          done
+
+      - name: Baseline - same checks on the published image (old OpenResty)
+        if: matrix.arch == 'amd64'
+        env:
+          EXPECTED_OPENRESTY: "1.31.1.1"
+          MIN_NGINX_VERSION: "1031001"
+        run: |
+          docker pull nginxproxymanager/nginx-full:latest
+          bash .github/ci-verify.sh nginxproxymanager/nginx-full:latest
+
+  npm-cypress:
+    # Full Nginx Proxy Manager Cypress suite on top of the new base, and on the
+    # currently published base as a baseline to tell regressions from flaky/pre-existing failures.
+    name: NPM cypress (${{ matrix.base }} base)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        base: [new, published]
+    env:
+      COMPOSE_PROJECT_NAME: npm_local_fulltest
+      COMPOSE_FILE: docker/docker-compose.ci.yml:docker/docker-compose.ci.sqlite.yml
+      NPM_IMAGE: nginx-proxy-manager:unknown-ci-0000
+    steps:
+      - uses: actions/checkout@v5
+        if: matrix.base == 'new'
+
+      - uses: docker/setup-buildx-action@v3
+        if: matrix.base == 'new'
+
+      - name: Bake certbot-node base (new)
+        if: matrix.base == 'new'
+        run: |
+          docker buildx bake --file docker/docker-bake.hcl --progress=plain --load \
+            --set "*.platform=linux/amd64" certbot-node
+          echo "BASE_IMAGE=nginxproxymanager/nginx-full:ci-certbot-node" >> "$GITHUB_ENV"
+
+      - name: Pull certbot-node base (published)
+        if: matrix.base == 'published'
+        run: |
+          docker pull nginxproxymanager/nginx-full:certbot-node
+          echo "BASE_IMAGE=nginxproxymanager/nginx-full:certbot-node" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: NginxProxyManager/nginx-proxy-manager
+          ref: develop
+          path: npm
+
+      - name: Build frontend
+        working-directory: npm
+        run: scripts/ci/frontend-build
+
+      - name: Build NPM image on ${{ env.BASE_IMAGE }}
+        working-directory: npm
+        run: |
+          # default (docker driver) builder so FROM can resolve the locally loaded base image
+          docker buildx build --builder default --load --progress=plain \
+            -t "$NPM_IMAGE" -f docker/Dockerfile \
+            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --build-arg TARGETPLATFORM=linux/amd64 \
+            --build-arg BUILD_VERSION=ci \
+            --build-arg BUILD_COMMIT="$(git rev-parse --short HEAD)" \
+            --build-arg BUILD_DATE="$(date '+%Y-%m-%d %T %Z')" \
+            .
+          docker run --rm --entrypoint nginx "$NPM_IMAGE" -v
+
+      - name: Check NPM image OpenResty version (new)
+        if: matrix.base == 'new'
+        run: |
+          docker run --rm --entrypoint nginx "$NPM_IMAGE" -v 2>&1 | grep -qx "nginx version: openresty/${EXPECTED_OPENRESTY}"
+
+      - name: Run NPM fullstack Cypress suite (sqlite)
+        working-directory: npm
+        run: |
+          scripts/ci/fulltest-cypress sqlite
+          code="$(docker inspect -f '{{.State.ExitCode}}' "$(docker compose ps --all -q cypress)")"
+          echo "cypress exit code: $code"
+          exit "$code"
+
+      - name: NPM container logs
+        if: always()
+        working-directory: npm
+        run: docker compose logs --no-color fullstack | tail -300 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cypress-results-${{ matrix.base }}
+          path: npm/test/results
+          if-no-files-found: warn
